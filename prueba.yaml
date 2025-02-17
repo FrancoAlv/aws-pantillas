@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Despliega WordPress con RDS MySQL 5.7, Auto Scaling (Launch Template) y un ALB en Amazon Linux 2023.
+
+Parameters:
+  KeyName:
+    Description: Nombre de la llave EC2 para acceso SSH
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Description: Tipo de instancia EC2
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t2.small
+      - t2.medium
+      - t3.small
+      - t3.medium
+
+  AL2023AMI:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Description: "AMI de Amazon Linux 2023 para x86_64 en la región actual"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+  VpcId:
+    Description: ID de la VPC
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Description: Lista de subredes (públicas) para el ALB y el ASG
+    Type: List<AWS::EC2::Subnet::Id>
+
+  DBName:
+    Description: Nombre de la base de datos
+    Type: String
+    Default: wordpressdb
+
+  DBUsername:
+    Description: Usuario de la base de datos
+    Type: String
+    Default: wordpressuser
+
+  DBPassword:
+    Description: Contraseña de la base de datos
+    Type: String
+    NoEcho: true
+
+  DBAllocatedStorage:
+    Description: Tamaño de la base de datos (en GB)
+    Type: Number
+    Default: 5
+
+  DesiredCapacity:
+    Description: Capacidad deseada para el grupo de Auto Scaling
+    Type: Number
+    Default: 2
+
+  MinSize:
+    Description: Tamaño mínimo del grupo de Auto Scaling
+    Type: Number
+    Default: 2
+
+  MaxSize:
+    Description: Tamaño máximo del grupo de Auto Scaling
+    Type: Number
+    Default: 4
+
+Resources:
+  ######################################################
+  # Grupos de seguridad
+  ######################################################
+  WordPressALBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Seguridad para el ALB que balancea la carga de WordPress
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  WordPressInstanceSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Seguridad para las instancias de WordPress
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Recibe tráfico HTTP desde el ALB
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref WordPressALBSG
+        # Acceso SSH (opcional, puedes restringirlo)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Seguridad para la base de datos RDS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Permitir tráfico MySQL desde las instancias
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WordPressInstanceSG
+
+  ######################################################
+  # RDS MySQL 5.7
+  ######################################################
+  WordPressDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBInstanceClass: db.t3.micro
+      Engine: MySQL
+      EngineVersion: "5.7"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      PubliclyAccessible: true
+
+  ######################################################
+  # Launch Template (sustituye Launch Configuration)
+  ######################################################
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AL2023AMI
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref WordPressInstanceSG
+        UserData:
+          Fn::Base64:
+            Fn::Sub: 
+              - |
+                #!/bin/bash -xe
+                exec > /tmp/userdata.log 2>&1
+                
+                dnf update -y
+                # Instalar Apache, PHP y la extensión para MySQL
+                dnf install -y httpd php php-mysqlnd
+                
+                systemctl enable httpd
+                systemctl start httpd
+
+                # Crear un log de directorios instalados
+                echo "Listando rutas de instalación en /var/www/html:" >> /tmp/userdata.log
+                mkdir -p /var/www/html
+                ls -l /var/www/html >> /tmp/userdata.log
+
+                cd /var/www/html
+                wget https://wordpress.org/latest.tar.gz
+                tar -xzf latest.tar.gz --strip-components=1
+                rm -f latest.tar.gz
+
+                cp wp-config-sample.php wp-config.php
+                sed -i "s/database_name_here/${DBName}/" wp-config.php
+                sed -i "s/username_here/${DBUsername}/" wp-config.php
+                sed -i "s/password_here/${DBPassword}/" wp-config.php
+                sed -i "s/localhost/${DBEndpoint}/" wp-config.php
+
+                systemctl restart httpd
+                
+                # Log final de directorios en /var/www/html
+                echo "Contenido final de /var/www/html:" >> /tmp/userdata.log
+                ls -l /var/www/html >> /tmp/userdata.log
+              - DBName: !Ref DBName
+                DBUsername: !Ref DBUsername
+                DBPassword: !Ref DBPassword
+                DBEndpoint: !GetAtt WordPressDB.Endpoint.Address
+
+
+  ######################################################
+  # Auto Scaling Group
+  ######################################################
+  WordPressASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref SubnetIds
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref WordPressTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: WordPressInstance
+          PropagateAtLaunch: true
+
+  ######################################################
+  # Application Load Balancer (ALB)
+  ######################################################
+  WordPressLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: WordPressLB
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref WordPressALBSG
+
+  WordPressTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: WordPressTG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: "lb_cookie"
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: "3600"
+
+  WordPressListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WordPressLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WordPressTargetGroup
+
+Outputs:
+  LoadBalancerDNSName:
+    Description: "DNS Name del Load Balancer"
+    Value: !GetAtt WordPressLoadBalancer.DNSName
