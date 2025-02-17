@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Despliegue de WordPress y MySQL en una sola instancia EC2 (sin Load Balancer ni RDS),
+  usando Amazon Linux 2 con PHP 7.4 (compatible con WordPress 6.7.2).
+
+Parameters:
+  KeyName:
+    Description: Nombre de la llave EC2 para acceso SSH
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Description: Tipo de instancia EC2
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t2.small
+      - t2.medium
+      - t3.small
+      - t3.medium
+
+  AMI:
+    Description: AMI ID para la instancia EC2 (Amazon Linux 2)
+    Type: AWS::EC2::Image::Id
+    Default: ami-0c94855ba95c71c99
+
+  DBName:
+    Description: Nombre de la base de datos local
+    Type: String
+    Default: wordpressdb
+
+  DBUsername:
+    Description: Usuario de la base de datos local
+    Type: String
+    Default: wordpressuser
+
+  DBPassword:
+    Description: Contraseña de la base de datos local
+    Type: String
+    NoEcho: true
+    Default: wordpresspass
+
+Resources:
+  ######################################################
+  # Security Group para la instancia
+  ######################################################
+  WordPressSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite HTTP (80) y SSH (22)
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+
+  ######################################################
+  # Instancia EC2 con WordPress y MySQL local
+  ######################################################
+  WordPressInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !GetAtt WordPressSG.GroupId
+      ImageId: !Ref AMI
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Actualizar paquetes
+          yum update -y
+
+          # Habilitar el repositorio para PHP 7.4 en Amazon Linux 2
+          amazon-linux-extras enable php7.4
+          yum clean metadata
+
+          # Instalar Apache, PHP 7.4 y la extensión para MySQL, además de MariaDB Server
+          yum install -y httpd mariadb-server php php-mysqlnd
+
+          # Iniciar y habilitar Apache y MariaDB
+          systemctl start httpd
+          systemctl enable httpd
+          systemctl start mariadb
+          systemctl enable mariadb
+
+          # Configurar MariaDB: crear base de datos y usuario para WordPress
+          mysql -e "CREATE DATABASE ${DBName};"
+          mysql -e "CREATE USER '${DBUsername}'@'localhost' IDENTIFIED BY '${DBPassword}';"
+          mysql -e "GRANT ALL PRIVILEGES ON ${DBName}.* TO '${DBUsername}'@'localhost';"
+          mysql -e "FLUSH PRIVILEGES;"
+
+          # Descargar e instalar WordPress
+          cd /var/www/html
+          wget https://wordpress.org/latest.tar.gz
+          tar -xzf latest.tar.gz --strip-components=1
+          rm -f latest.tar.gz
+
+          # Configurar wp-config.php
+          cp wp-config-sample.php wp-config.php
+          sed -i "s/database_name_here/${DBName}/" wp-config.php
+          sed -i "s/username_here/${DBUsername}/" wp-config.php
+          sed -i "s/password_here/${DBPassword}/" wp-config.php
+          # El host de la DB es "localhost" porque está en la misma instancia
+
+          # Ajustar permisos para Apache
+          chown apache:apache /var/www/html -R
+
+          # Reiniciar Apache para aplicar cambios
+          systemctl restart httpd
+
+Outputs:
+  InstancePublicIP:
+    Description: "Dirección IP pública de la instancia"
+    Value: !GetAtt WordPressInstance.PublicIp
+
+  WordPressURL:
+    Description: "URL de WordPress (usando la IP pública)"
+    Value: !Sub "http://${WordPressInstance.PublicIp}"
